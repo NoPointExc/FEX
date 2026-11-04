@@ -6,6 +6,19 @@
 #include <winternl.h>
 
 namespace FEX::Windows {
+// Converts into a stack buffer rather than letting ntdll allocate from the process heap. This is called while holding locks that
+// heap code can also need (e.g. ThreadCreationMutex on image map, taken by heap growth through the NtAllocateVirtualMemory
+// notification), so a process heap allocation here can deadlock against another thread holding the heap lock.
+inline fextl::string UnicodeStringToAnsi(const UNICODE_STRING& StringW) {
+  std::array<char, PATH_MAX * 3> Buf;
+  STRING StringA {.Length = 0, .MaximumLength = Buf.size(), .Buffer = Buf.data()};
+  if (RtlUnicodeStringToAnsiString(&StringA, &StringW, FALSE)) {
+    return {};
+  }
+
+  return fextl::string(StringA.Buffer, StringA.Length);
+}
+
 inline fextl::string GetExecutableFilePath() {
   std::array<WCHAR, PATH_MAX> Buf;
   UNICODE_STRING PathW {.Length = 0, .MaximumLength = Buf.size() * sizeof(WCHAR), .Buffer = Buf.data()};
@@ -14,12 +27,7 @@ inline fextl::string GetExecutableFilePath() {
     return {};
   }
 
-  STRING PathA;
-  RtlUnicodeStringToAnsiString(&PathA, &PathW, TRUE);
-  fextl::string Path(PathA.Buffer);
-  RtlFreeAnsiString(&PathA);
-
-  return Path;
+  return UnicodeStringToAnsi(PathW);
 }
 
 inline fextl::string GetSectionFilePath(uint64_t Address) {
@@ -32,12 +40,7 @@ inline fextl::string GetSectionFilePath(uint64_t Address) {
     return {};
   }
 
-  STRING PathA;
-  RtlUnicodeStringToAnsiString(&PathA, &Buffer.Info.SectionFileName, TRUE);
-  fextl::string Path(PathA.Buffer);
-  RtlFreeAnsiString(&PathA);
-
-  return Path;
+  return UnicodeStringToAnsi(Buffer.Info.SectionFileName);
 }
 
 inline std::string_view BaseName(std::string_view Path) {
