@@ -1,0 +1,159 @@
+From 0f7f03a608fd276f79fb31eb91264e00458f5888 Mon Sep 17 00:00:00 2001
+From: Jiayang Sun <4702563+NoPointExc@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:43:07 -0600
+Subject: [PATCH 1/2] Windows: Track executable images mapped without loader
+ notification
+
+Wine only sends NotifyMapViewOfSection for images mapped by the loader
+(TEB ArbitraryUserPointer set). Images mapped directly with
+NtMapViewOfSection, such as the private ntdll copy Themida maps to issue
+syscalls, were never added to XIntervals, so jumping into them raised a
+NoExec fault. Query the real page protection when an address is not
+tracked and register committed executable image regions.
+
+Fixes MapleStory M (Steam 3969080) crashing at startup on ARM64EC.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/Common/InvalidationTracker.cpp | 33 +++++++++++++++++--
+ Source/Windows/Common/InvalidationTracker.h   |  1 +
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d35..1802769aa 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -248,11 +248,40 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+ 
++bool InvalidationTracker::TrackUnnotifiedImageRegion(uint64_t Address) {
++  // Wine only sends map notifications for images mapped by the loader (ArbitraryUserPointer set), so an image
++  // mapped directly with NtMapViewOfSection (e.g. a private ntdll copy used by some protectors) is never registered.
++  MEMORY_BASIC_INFORMATION Info;
++  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
++      Info.State != MEM_COMMIT || Info.Type != MEM_IMAGE || !ProtHasExec(Info.Protect)) {
++    return false;
++  }
++
++  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
++  FEXCore::IntervalList<uint64_t>::Interval Region {Base, Base + Info.RegionSize};
++  LogMan::Msg::IFmt("Tracking unnotified executable image region: {:X} - {:X}", Region.Offset, Region.End);
++
++  std::unique_lock Lock(IntervalsLock);
++  XIntervals.Insert(Region);
++  if (ProtIsWritable(Info.Protect)) {
++    RWXIntervals.Insert(Region);
++  }
++  return true;
++}
++
+ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+   std::shared_lock Lock(IntervalsLock);
+-  const auto XResult = XIntervals.Query(Address);
++  auto XResult = XIntervals.Query(Address);
+   if (!XResult.Enclosed) {
+-    return {};
++    Lock.unlock();
++    if (!TrackUnnotifiedImageRegion(Address)) {
++      return {};
++    }
++    Lock.lock();
++    XResult = XIntervals.Query(Address);
++    if (!XResult.Enclosed) {
++      return {};
++    }
+   }
+   const auto RWXResult = RWXIntervals.Query(Address);
+   if (RWXResult.Enclosed) {
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bcaa..9787aa83c 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -42,6 +42,7 @@ public:
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
+ private:
++  bool TrackUnnotifiedImageRegion(uint64_t Address);
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+   void DisableSMCDetection();
+   void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
+-- 
+2.39.2
+
+
+From 2a91afdbdb057b87b5fcfe988a29eb67e7bb231a Mon Sep 17 00:00:00 2001
+From: Jiayang Sun <4702563+NoPointExc@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:43:07 -0600
+Subject: [PATCH 2/2] Windows: Avoid process heap allocations when converting
+ section paths
+
+GetSectionFilePath is called from HandleImageMap while ThreadCreationMutex
+is held, and RtlUnicodeStringToAnsiString(..., TRUE) allocates from the
+process heap. A thread already holding the heap lock can need
+ThreadCreationMutex through the NtAllocateVirtualMemory notification when
+the heap grows, so this deadlocks: seen in MapleStory Classic World with
+the window thread stuck holding the loader lock.
+
+Convert into a stack buffer instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/Common/Module.h | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/Source/Windows/Common/Module.h b/Source/Windows/Common/Module.h
+index 2076e1f6f..0ec13b691 100644
+--- a/Source/Windows/Common/Module.h
++++ b/Source/Windows/Common/Module.h
+@@ -6,6 +6,19 @@
+ #include <winternl.h>
+ 
+ namespace FEX::Windows {
++// Converts into a stack buffer rather than letting ntdll allocate from the process heap. This is called while holding locks that
++// heap code can also need (e.g. ThreadCreationMutex on image map, taken by heap growth through the NtAllocateVirtualMemory
++// notification), so a process heap allocation here can deadlock against another thread holding the heap lock.
++inline fextl::string UnicodeStringToAnsi(const UNICODE_STRING& StringW) {
++  std::array<char, PATH_MAX * 3> Buf;
++  STRING StringA {.Length = 0, .MaximumLength = Buf.size(), .Buffer = Buf.data()};
++  if (RtlUnicodeStringToAnsiString(&StringA, &StringW, FALSE)) {
++    return {};
++  }
++
++  return fextl::string(StringA.Buffer, StringA.Length);
++}
++
+ inline fextl::string GetExecutableFilePath() {
+   std::array<WCHAR, PATH_MAX> Buf;
+   UNICODE_STRING PathW {.Length = 0, .MaximumLength = Buf.size() * sizeof(WCHAR), .Buffer = Buf.data()};
+@@ -14,12 +27,7 @@ inline fextl::string GetExecutableFilePath() {
+     return {};
+   }
+ 
+-  STRING PathA;
+-  RtlUnicodeStringToAnsiString(&PathA, &PathW, TRUE);
+-  fextl::string Path(PathA.Buffer);
+-  RtlFreeAnsiString(&PathA);
+-
+-  return Path;
++  return UnicodeStringToAnsi(PathW);
+ }
+ 
+ inline fextl::string GetSectionFilePath(uint64_t Address) {
+@@ -32,12 +40,7 @@ inline fextl::string GetSectionFilePath(uint64_t Address) {
+     return {};
+   }
+ 
+-  STRING PathA;
+-  RtlUnicodeStringToAnsiString(&PathA, &Buffer.Info.SectionFileName, TRUE);
+-  fextl::string Path(PathA.Buffer);
+-  RtlFreeAnsiString(&PathA);
+-
+-  return Path;
++  return UnicodeStringToAnsi(Buffer.Info.SectionFileName);
+ }
+ 
+ inline std::string_view BaseName(std::string_view Path) {
+-- 
+2.39.2
+

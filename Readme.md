@@ -1,3 +1,11 @@
+> [!WARNING]
+> **Unofficial fork for MapleStory Classic World on ARM Android.**
+> This fork adds two small ARM64EC fixes so MapleStory Classic World (Steam 216150) runs under
+> Proton on a Retroid Pocket 6 with DroidDeck. It is **not tested with other games or devices**
+> and is not part of upstream [FEX-Emu/FEX](https://github.com/FEX-Emu/FEX).
+> The changes were written with an AI coding agent, so they must not be sent to FEX-Emu as a pull request.
+> Details, build steps and a guide for coding agents: [MAPLESTORY-CLASSIC.md](MAPLESTORY-CLASSIC.md).
+
 [中文](https://github.com/FEX-Emu/FEX/blob/main/docs/Readme_CN.md)
 # FEX: Emulate x86 Programs on ARM64
 FEX allows you to run x86 applications on ARM64 Linux devices, similar to qemu-user and box64.
