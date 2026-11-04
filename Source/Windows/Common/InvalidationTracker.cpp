@@ -248,11 +248,40 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
   return ProtectRWXIntervalsInternal(Address, Size, true);
 }
 
+bool InvalidationTracker::TrackUnnotifiedImageRegion(uint64_t Address) {
+  // Wine only sends map notifications for images mapped by the loader (ArbitraryUserPointer set), so an image
+  // mapped directly with NtMapViewOfSection (e.g. a private ntdll copy used by some protectors) is never registered.
+  MEMORY_BASIC_INFORMATION Info;
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
+      Info.State != MEM_COMMIT || Info.Type != MEM_IMAGE || !ProtHasExec(Info.Protect)) {
+    return false;
+  }
+
+  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  FEXCore::IntervalList<uint64_t>::Interval Region {Base, Base + Info.RegionSize};
+  LogMan::Msg::IFmt("Tracking unnotified executable image region: {:X} - {:X}", Region.Offset, Region.End);
+
+  std::unique_lock Lock(IntervalsLock);
+  XIntervals.Insert(Region);
+  if (ProtIsWritable(Info.Protect)) {
+    RWXIntervals.Insert(Region);
+  }
+  return true;
+}
+
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
   std::shared_lock Lock(IntervalsLock);
-  const auto XResult = XIntervals.Query(Address);
+  auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
-    return {};
+    Lock.unlock();
+    if (!TrackUnnotifiedImageRegion(Address)) {
+      return {};
+    }
+    Lock.lock();
+    XResult = XIntervals.Query(Address);
+    if (!XResult.Enclosed) {
+      return {};
+    }
   }
   const auto RWXResult = RWXIntervals.Query(Address);
   if (RWXResult.Enclosed) {
